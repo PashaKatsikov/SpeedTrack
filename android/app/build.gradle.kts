@@ -3,8 +3,15 @@ import java.io.FileInputStream
 
 plugins {
     id("com.android.application")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id("kotlin-android")
+    // Flutter Gradle Plugin must be applied after Android + Kotlin plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// Google Services plugin only if google-services.json is present so the
+// project builds before Firebase credentials are supplied.
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 val keystorePropertiesFile = rootProject.file("key.properties")
@@ -16,21 +23,24 @@ if (hasKeystoreProperties) {
 
 android {
     namespace = "com.cctvspeed.cctvspeedtrack"
-    compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+
+    // Per gray-flow guide: targetSdk=35, minSdk=30, compileSdk=36 to
+    // satisfy plugins whose transitive deps demand it.
+    compileSdk = 36
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
+        // flutter_local_notifications 18+ needs core-library desugaring
+        // (java.time.*).
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.cctvspeed.cctvspeedtrack"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        minSdk = 30
+        targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
@@ -48,10 +58,12 @@ android {
 
     buildTypes {
         release {
-            // Uses the real release keystore when key.properties is present
-            // (see android/key.properties, generated locally and kept out of
-            // version control); otherwise falls back to the debug keys so
-            // `flutter run --release` still works out of the box.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             signingConfig = if (hasKeystoreProperties) {
                 signingConfigs.getByName("release")
             } else {
@@ -65,6 +77,10 @@ kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
+}
+
+dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
 
 flutter {

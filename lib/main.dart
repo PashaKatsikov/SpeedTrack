@@ -1,43 +1,73 @@
+import 'package:firebase_app_check/firebase_app_check.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'app_theme.dart';
-import 'screens/loading_screen.dart';
+import 'boot/track_shell.dart';
+import 'pipe/alert_hub.dart';
+import 'pipe/gate_probe.dart';
+import 'pipe/link_pulse.dart';
+import 'pipe/local_store.dart';
+import 'pipe/signal_relay.dart';
+import 'pipe/ua_masker.dart';
 
-void main() {
+/// Bootstrap.
+///
+/// Wiring order (do NOT reshuffle without reading the gray-flow guide):
+///   1. Bindings ensure — required before any plugin call.
+///   2. Firebase + AppCheck — best-effort. When google-services.json
+///      is absent (template ships without it) the try/catch swallows
+///      the failure and the shell falls back to arcade mode. NEVER
+///      block startup on Firebase.
+///   3. Orientation whitelist — all four; game locks to portrait
+///      itself inside LiftoffGate._goArcade / MenuScreen.
+///   4. Status bar transparent + light icons — loading artwork is
+///      edge-to-edge.
+///   5. siteAgent.warmUp() — forges the device UA BEFORE any bridge
+///      is created. The gate probe uses the primed value on its very
+///      first HTTP call.
+///   6. LocalStore.warmUp() — reads SharedPreferences into memory so
+///      the first frame of LiftoffGate can decide the route
+///      synchronously (no async await = no blank splash flicker).
+///   7. Bridges constructed but not booted here — AlertHub +
+///      SignalRelay ignite inside LiftoffGate after the UI is up.
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Loading screen may be portrait or landscape; gameplay locks to portrait
-  // once loading completes (see LoadingScreen).
-  SystemChrome.setEnabledSystemUIMode(
-    SystemUiMode.edgeToEdge,
-  );
-  SystemChrome.setSystemUIOverlayStyle(
-    const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-    ),
-  );
-  runApp(const SpeedTrackApp());
-}
 
-class SpeedTrackApp extends StatelessWidget {
-  const SpeedTrackApp({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Speed Track',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        fontFamily: 'Roboto',
-        scaffoldBackgroundColor: AppColors.bgDeep,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: AppColors.neonBlue,
-          brightness: Brightness.dark,
-        ),
-      ),
-      home: const LoadingScreen(),
+  try {
+    await Firebase.initializeApp();
+    await FirebaseAppCheck.instance.activate(
+      providerAndroid: kDebugMode
+          ? const AndroidDebugProvider()
+          : const AndroidPlayIntegrityProvider(),
     );
+  } catch (_) {
+    // No google-services.json yet — that's fine, gray mode simply
+    // won't activate until credentials land.
   }
+
+  await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.light,
+  ));
+
+  await siteAgent.warmUp();
+
+  final LocalStore store = LocalStore();
+  await store.warmUp();
+
+  final LinkPulse linkPulse = LinkPulse();
+  final SignalRelay signalRelay = SignalRelay();
+  final GateProbe gateProbe = GateProbe(store);
+  final AlertHub alertHub = AlertHub(store);
+
+  runApp(TrackShell(
+    store: store,
+    linkPulse: linkPulse,
+    signalRelay: signalRelay,
+    gateProbe: gateProbe,
+    alertHub: alertHub,
+  ));
 }
