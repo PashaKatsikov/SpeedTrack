@@ -48,7 +48,10 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
   bool _offlineOpened = false;
   String? _lastMainFrame;
   int _redirectRetries = 0;
+  int _serverRetries = 0;
+  static const int _maxServerRetries = 2;
   Timer? _offlineDebounce;
+  Timer? _serverRetryTimer;
   StreamSubscription<List<ConnectivityResult>>? _connSub;
   static const MethodChannel _fileChannel =
       MethodChannel('speedtrack/filepick');
@@ -109,6 +112,7 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
         onPageFinished: (_) {
           if (mounted) setState(() => _spinner = false);
           _redirectRetries = 0;
+          _serverRetries = 0;
           _neutraliseSafeArea();
           _wireKeyboardScroll();
         },
@@ -143,7 +147,7 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
           if (isDnsOrDisconnect) {
             _openOfflineDirect();
           } else {
-            _guardOffline();
+            _handleServerError();
           }
         },
         onNavigationRequest: (NavigationRequest req) {
@@ -212,11 +216,30 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  /// Probe-then-show: for WebView load errors that might be transient.
-  Future<void> _guardOffline() async {
+  /// Non-DNS load failure (ERR_CONNECTION_REFUSED / RESET / TIMED_OUT
+  /// / SSL_PROTOCOL_ERROR / 5xx). These are typically server-side or
+  /// transient network hiccups on the partner edge — internet works,
+  /// but the destination refused the socket. Never leave the spinner
+  /// hanging: retry with backoff up to `_maxServerRetries`, then fall
+  /// back to the No-Wifi screen so the user has a visible Retry.
+  Future<void> _handleServerError() async {
     if (_offlineOpened) return;
     final bool online = await widget.linkPulse.isReachable();
-    if (online) return;
+    if (!online) {
+      _openOfflineDirect();
+      return;
+    }
+    if (_serverRetries < _maxServerRetries) {
+      _serverRetries++;
+      final int delayMs = 900 * _serverRetries;
+      _serverRetryTimer?.cancel();
+      _serverRetryTimer = Timer(Duration(milliseconds: delayMs), () {
+        if (!mounted || _offlineOpened) return;
+        final String target = _lastMainFrame ?? widget.link;
+        _web.loadRequest(Uri.parse(target));
+      });
+      return;
+    }
     _openOfflineDirect();
   }
 
@@ -315,6 +338,7 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _connSub?.cancel();
     _offlineDebounce?.cancel();
+    _serverRetryTimer?.cancel();
     widget.alertHub.onLink = null;
     SystemChrome.setEnabledSystemUIMode(
       SystemUiMode.manual,
