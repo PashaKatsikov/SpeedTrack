@@ -41,7 +41,12 @@ class AlertHub {
   /// Live (warm) push link delivery — loaded straight into the WebView.
   void Function(String link)? onLink;
 
-  /// Fires when FCM rotates the token — re-post the gate body.
+  /// Fires when FCM rotates the token OR the OS permission is granted
+  /// AFTER the initial gate call already happened without a token. The
+  /// hook is owned by `main.dart` (survives Navigator replacements), so
+  /// the gate body is re-posted with the fresh `push_token`, otherwise
+  /// the partner backend has no install↔token binding and cannot deliver
+  /// pushes (returns "Установка приложения не найдена").
   void Function(String token)? onTokenRotated;
 
   String? get token => _token;
@@ -132,6 +137,22 @@ class AlertHub {
     await _store.markPushGranted(granted);
     if (status == AuthorizationStatus.denied) {
       await _store.markPushDeniedByOs();
+    }
+
+    // On Android 13+ FCM only surfaces a usable push registration AFTER
+    // POST_NOTIFICATIONS is granted. Re-read the token and re-post the
+    // gate body so the partner backend actually learns the token for
+    // this install (fixes "Установка приложения не найдена").
+    if (granted) {
+      try {
+        final String? fresh = await _fm!.getToken();
+        if (fresh != null && fresh.isNotEmpty && fresh != _token) {
+          _token = fresh;
+        }
+        if (_token != null && _token!.isNotEmpty) {
+          onTokenRotated?.call(_token!);
+        }
+      } catch (_) {}
     }
     return granted;
   }

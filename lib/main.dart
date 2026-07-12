@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'dart:io';
+
 import 'boot/track_shell.dart';
 import 'pipe/alert_hub.dart';
 import 'pipe/gate_probe.dart';
@@ -62,6 +64,22 @@ Future<void> main() async {
   final SignalRelay signalRelay = SignalRelay();
   final GateProbe gateProbe = GateProbe(store);
   final AlertHub alertHub = AlertHub(store);
+
+  // Long-lived push-token → gate re-post hook. Owned here (not in
+  // LiftoffGate) so it survives Navigator.pushReplacement transitions
+  // to the opt-in / WebView screens. Without this the partner backend
+  // never learns the FCM token for this install and every push is
+  // rejected with "Установка приложения не найдена".
+  alertHub.onTokenRotated = (String token) {
+    () async {
+      try {
+        final String locale = Platform.localeName.replaceAll('-', '_');
+        final Map<String, dynamic> body =
+            await signalRelay.assembleGateBody(locale: locale, pushToken: token);
+        await gateProbe.query(body);
+      } catch (_) {}
+    }();
+  };
 
   runApp(TrackShell(
     store: store,

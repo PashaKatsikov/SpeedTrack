@@ -67,13 +67,13 @@ class _LiftoffGateState extends State<LiftoffGate>
       vsync: this,
       duration: const Duration(milliseconds: 1400),
     )..repeat();
-    widget.alertHub.onTokenRotated = _repostWithToken;
+    // onTokenRotated is wired in main.dart (long-lived) so that gate
+    // re-posts survive pushReplacement to the opt-in / WebView screens.
     _drive();
   }
 
   @override
   void dispose() {
-    widget.alertHub.onTokenRotated = null;
     _dots.dispose();
     super.dispose();
   }
@@ -180,16 +180,6 @@ class _LiftoffGateState extends State<LiftoffGate>
       pushToken: widget.alertHub.token,
     );
     return widget.gateProbe.query(body);
-  }
-
-  Future<void> _repostWithToken(String token) async {
-    final String locale = Platform.localeName.replaceAll('-', '_');
-    final Map<String, dynamic> body =
-        await widget.signalRelay.assembleGateBody(
-      locale: locale,
-      pushToken: token,
-    );
-    widget.gateProbe.query(body);
   }
 
   Future<void> _settle() =>
