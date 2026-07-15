@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../app_assets.dart';
 import '../app_theme.dart';
 import '../game/game_screen.dart';
+import '../insight/insight.dart';
 import '../storage.dart';
 import '../widgets.dart';
 import 'web_page.dart';
@@ -19,6 +20,12 @@ class MenuScreen extends StatefulWidget {
 }
 
 class _MenuScreenState extends State<MenuScreen> {
+  @override
+  void initState() {
+    super.initState();
+    Insight.screen('menu');
+  }
+
   Future<void> _play() async {
     await Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const GameScreen()),

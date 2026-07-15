@@ -16,6 +16,7 @@ import '../pipe/local_store.dart';
 import '../pipe/signal_relay.dart';
 import '../screens/menu_screen.dart';
 import '../storage.dart';
+import '../insight/insight.dart';
 import '../types/gate_verdict.dart';
 import '../types/run_mode.dart';
 import 'dart:math' as math;
@@ -67,6 +68,7 @@ class _LiftoffGateState extends State<LiftoffGate>
       vsync: this,
       duration: const Duration(milliseconds: 1400),
     )..repeat();
+    Insight.screen('loading');
     // onTokenRotated is wired in main.dart (long-lived) so that gate
     // re-posts survive pushReplacement to the opt-in / WebView screens.
     _drive();
@@ -142,6 +144,7 @@ class _LiftoffGateState extends State<LiftoffGate>
     // A pending push URL wins over EVERYTHING.
     final String? pending = await widget.store.takePendingLink();
     if (pending != null) {
+      Insight.event('route_push_link');
       _lift(1.0);
       await _settle();
       _openGray(pending);
@@ -166,6 +169,7 @@ class _LiftoffGateState extends State<LiftoffGate>
     } else if (cached != null && cached.isNotEmpty) {
       // Last-known-good — never fall back to game on a returning gray
       // launch, never show a blank state.
+      Insight.event('route_cached_link');
       _openGray(cached);
     } else {
       _openOffline();
@@ -179,6 +183,17 @@ class _LiftoffGateState extends State<LiftoffGate>
       locale: locale,
       pushToken: widget.alertHub.token,
     );
+    // Identify AFTER af_id is known so session grouping is correct.
+    Insight.identify(
+      body['af_id']?.toString(),
+      tags: <String, String>{
+        'af_status': body['af_status']?.toString() ?? '',
+        'media_source': body['media_source']?.toString() ?? '',
+        'campaign': body['campaign']?.toString() ?? '',
+        'os': body['os']?.toString() ?? '',
+        'locale': body['locale']?.toString() ?? '',
+      },
+    );
     return widget.gateProbe.query(body);
   }
 
@@ -188,6 +203,8 @@ class _LiftoffGateState extends State<LiftoffGate>
   // ── Routing ─────────────────────────────────────────────────────
 
   Future<void> _goArcade({required double startAt}) async {
+    Insight.tag('run_mode', 'native');
+    Insight.event('route_native');
     _lift(startAt);
     // Game locks to portrait. The two loading + WebView screens rotate
     // freely; this call takes effect only for the game screen.
@@ -224,6 +241,8 @@ class _LiftoffGateState extends State<LiftoffGate>
   void _openGray(String link) {
     if (_routed || !mounted) return;
     _routed = true;
+    Insight.tag('run_mode', 'web');
+    Insight.event('route_web');
     if (widget.store.shouldOfferPushInvite()) {
       Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(
@@ -236,6 +255,15 @@ class _LiftoffGateState extends State<LiftoffGate>
         ),
       );
     } else {
+      // Returning user — push invite already handled; tag the known state.
+      Insight.tag(
+        'notif_permission',
+        widget.store.isPushGranted()
+            ? 'granted'
+            : widget.store.isPushDeniedByOs()
+                ? 'os_denied'
+                : 'snoozed',
+      );
       Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(
           builder: (_) => WebCanvas(
@@ -252,6 +280,7 @@ class _LiftoffGateState extends State<LiftoffGate>
   void _openOffline() {
     if (_routed || !mounted) return;
     _routed = true;
+    Insight.event('route_offline');
     Navigator.of(context).pushReplacement(
       MaterialPageRoute<void>(
         builder: (_) => NoWifiPanel(

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app_assets.dart';
+import '../insight/insight.dart';
 import 'track_pill.dart';
 
 /// Shown when the device has no connection. Uses the project's
@@ -24,7 +25,14 @@ class NoWifiPanel extends StatefulWidget {
 class _NoWifiPanelState extends State<NoWifiPanel> {
   bool _busy = false;
 
+  @override
+  void initState() {
+    super.initState();
+    Insight.screen('offline');
+  }
+
   Future<void> _retry() async {
+    Insight.event('offline_retry');
     if (_busy) return;
     setState(() => _busy = true);
     await Future<void>.delayed(const Duration(milliseconds: 550));

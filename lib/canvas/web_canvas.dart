@@ -8,6 +8,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
+import '../insight/insight.dart';
 import '../pipe/alert_hub.dart';
 import '../pipe/link_pulse.dart';
 import '../pipe/local_store.dart';
@@ -18,12 +19,7 @@ import 'no_wifi_panel.dart';
 /// forged device UA, both orientations, immersive system UI,
 /// external-scheme hand-off, redirect-loop recovery, live connectivity
 /// guard, warm push link loading, third-party cookies, media autoplay,
-/// safe-area and keyboard JS fixes.
-///
-/// The WebView is wrapped in `SafeArea(bottom: false)` so the camera
-/// cutout is respected on BOTH orientations (top in portrait, sides in
-/// landscape). Bottom inset is left at 0 — the keyboard is handled by
-/// the JS scroll fix, not by layout resize.
+/// safe-area and keyboard JS fixes, and Microsoft Clarity funnel probes.
 class WebCanvas extends StatefulWidget {
   const WebCanvas({
     super.key,
@@ -56,6 +52,23 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
   static const MethodChannel _fileChannel =
       MethodChannel('speedtrack/filepick');
 
+  // Clarity funnel state — reset on each navigation.
+  bool _offerReached = false;
+  bool _pageHadError = false;
+
+  static final RegExp _depositRx = RegExp(
+    r'(deposit|cashier|top.?up|replenish|payment|checkout|wallet|пополн|депозит|касс|оплат|внести|платеж)',
+    caseSensitive: false,
+  );
+  static final RegExp _registerRx = RegExp(
+    r'(sign.?up|regist|create.?account|onboarding|регистрац|зарегистр)',
+    caseSensitive: false,
+  );
+  static final RegExp _loginRx = RegExp(
+    r'(sign.?in|log.?in|log.?on|/auth\b|authoriz|войти|вход|авториз)',
+    caseSensitive: false,
+  );
+
   @override
   void initState() {
     super.initState();
@@ -68,6 +81,9 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
     ]);
     _goImmersive();
     _buildController();
+
+    Insight.screen('web');
+    Insight.event('web_open');
 
     widget.alertHub.onLink = (String link) {
       if (mounted) _web.loadRequest(Uri.parse(link));
@@ -96,7 +112,12 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _goImmersive();
+    if (state == AppLifecycleState.resumed) {
+      _goImmersive();
+      Insight.event('web_foreground');
+    } else if (state == AppLifecycleState.paused) {
+      Insight.event('web_background');
+    }
   }
 
   void _buildController() {
@@ -107,20 +128,24 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
       ..enableZoom(false)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) {
+          _pageHadError = false;
           if (mounted) setState(() => _spinner = true);
         },
-        onPageFinished: (_) {
+        onPageFinished: (String url) {
           if (mounted) setState(() => _spinner = false);
           _redirectRetries = 0;
           _serverRetries = 0;
           _neutraliseSafeArea();
           _wireKeyboardScroll();
+          _installInsightProbe();
+          _trackWebPage(url);
         },
         onWebResourceError: (WebResourceError err) {
           if (err.isForMainFrame != true) return;
-          final String desc = err.description.toLowerCase();
+          _pageHadError = true;
 
           // Redirect-loop recovery.
+          final String desc = err.description.toLowerCase();
           final bool loop = desc.contains('too_many_redirects') ||
               desc.contains('too many redirects') ||
               err.errorCode == -1007 ||
@@ -131,9 +156,28 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
             return;
           }
 
-          // Cover the WebView's native error page IMMEDIATELY (spinner
-          // overlay) so the black-robot page is never visible.
+          // Cover the WebView's native error page IMMEDIATELY.
           if (mounted) setState(() => _spinner = true);
+
+          final String reason = _classifyWebError(err);
+          final String failed = _lastMainFrame ?? widget.link;
+          final String host = Uri.tryParse(failed)?.host ?? '';
+
+          Insight.event('web_error');
+          Insight.tag('web_error_reason', reason);
+          Insight.tag('web_last_error',
+              '${err.errorCode}:${err.description}'.substring(
+                  0,
+                  '${err.errorCode}:${err.description}'.length.clamp(0, 255)));
+          if (host.isNotEmpty) Insight.tag('web_error_host', host);
+
+          if (!_offerReached) {
+            Insight.event('web_offer_unreachable');
+            Insight.tag('offer_reached', 'false');
+            Insight.tag('offer_unreachable_reason', reason);
+          } else {
+            Insight.event('web_error_after_load');
+          }
 
           final bool isDnsOrDisconnect =
               desc.contains('name_not_resolved') ||
@@ -164,10 +208,17 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
             if (req.isMainFrame) _lastMainFrame = req.url;
             return NavigationDecision.navigate;
           }
+          Insight.event('web_external');
+          Insight.tag('web_external_scheme', uri.scheme);
           _openExternally(uri);
           return NavigationDecision.prevent;
         },
       ));
+
+    _web.addJavaScriptChannel(
+      'AegisInsight',
+      onMessageReceived: (JavaScriptMessage m) => _onWebSignal(m.message),
+    );
 
     _tuneAndroid();
     _web.loadRequest(Uri.parse(widget.link));
@@ -216,12 +267,7 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  /// Non-DNS load failure (ERR_CONNECTION_REFUSED / RESET / TIMED_OUT
-  /// / SSL_PROTOCOL_ERROR / 5xx). These are typically server-side or
-  /// transient network hiccups on the partner edge — internet works,
-  /// but the destination refused the socket. Never leave the spinner
-  /// hanging: retry with backoff up to `_maxServerRetries`, then fall
-  /// back to the No-Wifi screen so the user has a visible Retry.
+  /// Non-DNS load failure (ERR_CONNECTION_REFUSED / RESET / TIMED_OUT etc.).
   Future<void> _handleServerError() async {
     if (_offlineOpened) return;
     final bool online = await widget.linkPulse.isReachable();
@@ -243,8 +289,6 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
     _openOfflineDirect();
   }
 
-  /// Immediately swap to the No-Wifi panel. Retry rebuilds the WebView
-  /// at the last known main-frame URL.
   void _openOfflineDirect() {
     if (_offlineOpened || !mounted) return;
     _offlineOpened = true;
@@ -263,9 +307,151 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
     );
   }
 
-  /// Scrolls focused inputs above the on-screen keyboard. Uses
-  /// `behavior:'auto'` (never smooth — smooth fights the keyboard
-  /// animation and produces jitter, §3 of the pitfalls guide).
+  // ── Clarity funnel helpers ─────────────────────────────────────────
+
+  void _trackWebPage(String url) {
+    final Uri? uri = Uri.tryParse(url);
+    final String label = uri == null ? url : '${uri.host}${uri.path}';
+    Insight.screenName('web:$label');
+    Insight.event('web_page');
+    Insight.tag('web_last_url', url.length > 255 ? url.substring(0, 255) : url);
+
+    if (!_offerReached && !_pageHadError) {
+      _offerReached = true;
+      Insight.event('web_offer_reached');
+      Insight.tag('offer_reached', 'true');
+      if (uri?.host != null) Insight.tag('offer_host', uri!.host);
+    }
+    if (_depositRx.hasMatch(url)) {
+      Insight.event('web_cashier_page');
+      Insight.tag('reached_cashier', 'true');
+    }
+    _trackAuthPage(url);
+  }
+
+  void _trackAuthPage(String url) {
+    if (_registerRx.hasMatch(url)) {
+      Insight.event('web_register_page');
+      Insight.tag('reached_register', 'true');
+    } else if (_loginRx.hasMatch(url)) {
+      Insight.event('web_login_page');
+      Insight.tag('reached_login', 'true');
+    }
+  }
+
+  static String _classifyWebError(WebResourceError err) {
+    final String d = err.description.toLowerCase();
+    final int c = err.errorCode;
+    if (d.contains('connection_refused') || d.contains('connection refused')) {
+      return 'connection_refused';
+    }
+    if (d.contains('too_many_redirects') || d.contains('too many redirects')) {
+      return 'redirect_loop';
+    }
+    if (d.contains('name_not_resolved') ||
+        d.contains('address_unreachable') ||
+        d.contains('unknownhost') ||
+        c == -2) { return 'dns_unresolved'; }
+    if (d.contains('timed out') || d.contains('timeout') || c == -8) {
+      return 'timeout';
+    }
+    if (d.contains('internet_disconnected') ||
+        d.contains('network_changed') ||
+        c == -6) { return 'no_network'; }
+    if (d.contains('connection_reset')) return 'connection_reset';
+    if (d.contains('connection_closed') || d.contains('empty_response')) {
+      return 'connection_closed';
+    }
+    if (d.contains('ssl') || d.contains('cert') || c == -11) {
+      return 'ssl_error';
+    }
+    if (d.contains('blocked')) return 'blocked';
+    return 'other';
+  }
+
+  /// Idempotent JS probe — reports SPA route changes, deposit / register /
+  /// login button clicks, and auth form submits over the `AegisInsight`
+  /// channel. Safe to re-inject on every navigation.
+  void _installInsightProbe() {
+    _web.runJavaScript(r'''
+(function(){
+  if(window.__aegisInsight)return; window.__aegisInsight=true;
+  function send(t){ try{ AegisInsight.postMessage(t); }catch(e){} }
+  var DEP=/(deposit|cashier|top.?up|add funds|replenish|payment|pay now|checkout|withdraw|пополн|депозит|касс|оплат|внести|вывод|платеж)/i;
+  var REG=/(sign.?up|regist|create.?account|регистрац|зарегистр)/i;
+  var LOG=/(sign.?in|log.?in|log.?on|войти|вход|авториз)/i;
+  var lastPath='';
+  function reportPath(){ var p=location.pathname+location.search; if(p!==lastPath){ lastPath=p; send('path:'+p); } }
+  reportPath();
+  ['pushState','replaceState'].forEach(function(fn){
+    var o=history[fn]; history[fn]=function(){ var r=o.apply(this,arguments); setTimeout(reportPath,60); return r; };
+  });
+  window.addEventListener('popstate',function(){ setTimeout(reportPath,60); });
+  document.addEventListener('click',function(e){
+    try{ var el=e.target;
+      for(var i=0;i<4&&el;i++){
+        var t=((el.innerText||el.value||(el.getAttribute&&el.getAttribute('aria-label'))||'')+'').trim();
+        if(t){ if(DEP.test(t)){send('deposit_click:'+t.slice(0,60));return;}
+               if(REG.test(t)){send('register_click:'+t.slice(0,60));return;}
+               if(LOG.test(t)){send('login_click:'+t.slice(0,60));return;} }
+        el=el.parentElement;
+      }
+    }catch(x){}
+  },true);
+  document.addEventListener('submit',function(e){
+    try{ var f=e.target;
+      var pw=f.querySelectorAll?f.querySelectorAll('input[type="password"]'):[];
+      var blob=((f.innerText||'')+' '+(f.getAttribute('action')||'')+' '+(f.className||''));
+      var confirm=f.querySelector&&(f.querySelector('input[name*="confirm" i]')||f.querySelector('input[name*="repeat" i]'));
+      if(pw&&pw.length>=2){send('auth_submit:register');return;}
+      if(pw&&pw.length===1){ send('auth_submit:'+((confirm||REG.test(blob))?'register':'login')); return; }
+      if(REG.test(blob)){send('auth_submit:register');return;}
+      if(LOG.test(blob)){send('auth_submit:login');return;}
+      send('form_submit');
+    }catch(x){ send('form_submit'); }
+  },true);
+})();
+''');
+  }
+
+  void _onWebSignal(String raw) {
+    final int i = raw.indexOf(':');
+    final String type = i < 0 ? raw : raw.substring(0, i);
+    final String data = i < 0 ? '' : raw.substring(i + 1);
+    switch (type) {
+      case 'path':
+        Insight.event('web_spa_route');
+        Insight.tag('web_last_path', data);
+        if (_depositRx.hasMatch(data)) {
+          Insight.event('web_cashier_page');
+          Insight.tag('reached_cashier', 'true');
+        }
+        _trackAuthPage(data);
+      case 'deposit_click':
+        Insight.event('web_deposit_click');
+        Insight.tag('deposit_intent', 'true');
+        if (data.isNotEmpty) Insight.tag('deposit_label', data);
+      case 'register_click':
+        Insight.event('web_register_click');
+        Insight.tag('register_intent', 'true');
+      case 'login_click':
+        Insight.event('web_login_click');
+        Insight.tag('login_intent', 'true');
+      case 'auth_submit':
+        if (data == 'register') {
+          Insight.event('web_register_submit');
+          Insight.tag('attempted_register', 'true');
+        } else {
+          Insight.event('web_login_submit');
+          Insight.tag('attempted_login', 'true');
+        }
+      case 'form_submit':
+        Insight.event('web_form_submit');
+    }
+  }
+
+  // ── Keyboard + safe-area JS injections ────────────────────────────
+
   void _wireKeyboardScroll() {
     _web.runJavaScript(r'''
 (function(){
@@ -290,10 +476,6 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
 ''');
   }
 
-  /// Neutralises site safe-area CSS variables so notched devices show
-  /// no white bands. Only touches known top-spacer classes — NEVER
-  /// html / body / #app / #root, which would erase the site's own
-  /// horizontal gutters (see webview_safe_area_injection.mdc rule).
   void _neutraliseSafeArea() {
     _web.runJavaScript(r'''
 (function(){
@@ -363,9 +545,6 @@ class _WebCanvasState extends State<WebCanvas> with WidgetsBindingObserver {
         body: Stack(
           fit: StackFit.expand,
           children: <Widget>[
-            // WebView safe-area: keep the notch inset in BOTH
-            // orientations (top in portrait, sides in landscape). No
-            // bottom inset — the keyboard is handled by JS.
             SafeArea(
               bottom: false,
               child: WebViewWidget(controller: _web),

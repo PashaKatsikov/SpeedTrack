@@ -1,12 +1,14 @@
+import 'dart:io';
+
+import 'package:clarity_flutter/clarity_flutter.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'dart:io';
-
 import 'boot/track_shell.dart';
+import 'insight/insight.dart';
 import 'pipe/alert_hub.dart';
 import 'pipe/gate_probe.dart';
 import 'pipe/link_pulse.dart';
@@ -34,6 +36,8 @@ import 'pipe/ua_masker.dart';
 ///      synchronously (no async await = no blank splash flicker).
 ///   7. Bridges constructed but not booted here — AlertHub +
 ///      SignalRelay ignite inside LiftoffGate after the UI is up.
+///   8. ClarityWidget wraps the app root — must go last so the
+///      Flutter engine tree is already initialised.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -81,11 +85,14 @@ Future<void> main() async {
     }();
   };
 
-  runApp(TrackShell(
-    store: store,
-    linkPulse: linkPulse,
-    signalRelay: signalRelay,
-    gateProbe: gateProbe,
-    alertHub: alertHub,
+  runApp(ClarityWidget(
+    clarityConfig: Insight.config,
+    app: TrackShell(
+      store: store,
+      linkPulse: linkPulse,
+      signalRelay: signalRelay,
+      gateProbe: gateProbe,
+      alertHub: alertHub,
+    ),
   ));
 }
